@@ -149,6 +149,16 @@ public:
     }
 
     // TODO 2.7: 实现常用接口
+    void reset(T* ptr = nullptr) { 
+        release();
+        if(ptr != nullptr){
+            _ptr = ptr;
+            _control_block = new ControlBlock;
+            _control_block->strong_count = 1;
+            _control_block->weak_count = 0;
+        }
+    }
+
     int use_count() const { 
         if(_control_block)
             return _control_block->strong_count; 
@@ -197,6 +207,40 @@ public:
     // TODO 3.2: 实现析构函数
     ~MyWeakPtr() { 
         release();
+    }
+
+    MyWeakPtr(const MyWeakPtr& other) { 
+        _ptr = other._ptr;
+        _control_block = other._control_block;
+        if(_control_block)
+            _control_block->weak_count++;
+    }
+    MyWeakPtr& operator=(const MyWeakPtr& other) { 
+        if(this != &other){
+            release();
+            _ptr = other._ptr;
+            _control_block = other._control_block;
+            if(_control_block)
+                _control_block->weak_count++;
+        }
+        return *this;
+    }
+
+    MyWeakPtr(MyWeakPtr&& other) noexcept{
+        _ptr = other._ptr;
+        _control_block = other._control_block;
+        other._ptr = nullptr;
+        other._control_block = nullptr;
+    }
+    MyWeakPtr& operator=(MyWeakPtr&& other) {
+        if(this != &other){
+            release();
+            _ptr = other._ptr;
+            _control_block = other._control_block;
+            other._ptr = nullptr;
+            other._control_block = nullptr;
+        }
+        return *this;
     }
 
     // TODO 3.3: 实现核心功能
