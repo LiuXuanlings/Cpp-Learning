@@ -11,6 +11,37 @@ MemoryPool::MemoryPool(size_t BlockSize)
     , lastSlot_ (nullptr)
 {}
 
+/*
+析构 MemoryPool 时不需要释放 freeList_，这是因为 freeList_ 中的所有节点在物理上都属于 firstBlock_ 所指向的大块内存。
+所有权关系：
+firstBlock_ 链表管理的是所有向系统申请的 原始大块内存（Blocks）。
+freeList_ 链表管理的是从这些大块内存中切分出来的 小槽位（Slots）。
+
+
+需要转换成 void* 之后才调用 operator delete
+A. 避免调用析构函数
+如果你写 delete cur;（其中 cur 是 Slot*）：
+
+编译器会认为你正在销毁一个 Slot 对象。
+它会先调用 Slot 的析构函数 ~Slot()。
+
+B. 匹配内存申请时的行为
+在 allocateNewBlock 中，我们使用的是：
+
+code
+C++
+operator new(BlockSize_) // 申请的是原始字节流
+根据 C++ 标准，通过 operator new 申请的原始内存，应当通过 operator delete 配合 void* 来归还。这是一种对称的底层操作。
+
+C. 防止销毁不完整的对象
+在内存池的 Block 中，内存可能处于以下几种状态：
+
+存储着 Slot 结构（在空闲链表中时）。
+存储着用户对象 T（被分配出去后）。
+仅仅是填充字节（Padding）。
+当 MemoryPool 析构时，我们并不关心这一块块内存里现在装的是什么。通过 void* 释放，我们告诉编译器：“我只想要回这 BlockSize_ 个字节的内存，不需要你帮我做任何逻辑处理（比如调用某个对象的析构函数）。”
+*/
+
 MemoryPool::~MemoryPool()
 {
     // TODO：【资源清理】遍历并释放所有向系统申请的 Block
@@ -32,13 +63,16 @@ MemoryPool::~MemoryPool()
 void MemoryPool::init(size_t size)
 {
     assert(size > 0);
-    SlotSize_ = size;
+    //BlockSize_ 已在构造函数中初始化
+    SlotSize_ = std::max(size, sizeof(Slot)); // 确保每个槽位至少能放下 Slot 结构
     firstBlock_ = nullptr;
     curSlot_ = nullptr;
     freeList_ = nullptr;
     lastSlot_ = nullptr;
 }
 
+
+//返回 void* 指针，而不是返回Slot*, 因为 allocate 的接口对外是通用的，不能暴露内部实现细节 Slot 结构
 void* MemoryPool::allocate()
 {
     // TODO：【复用逻辑】优先尝试从无锁空闲链表中获取
@@ -48,6 +82,7 @@ void* MemoryPool::allocate()
     Slot * temp = popFreeList();
     if(temp!=nullptr) return reinterpret_cast<void*>(temp);
 
+    // 为内存分配和游标移动加锁，防止多个线程同时进入此临界区！！
     {
         // 加锁保护 Block 的申请和游标移动
         std::lock_guard<std::mutex>lock(mutexForBlock_);
@@ -57,11 +92,13 @@ void* MemoryPool::allocate()
         }
         temp = curSlot_;
         // 移动游标，指向下一个可用位置
-        // 注意：这里进行指针运算，SlotSize_ / sizeof(Slot) 是为了适配 Slot* 类型的步长
-        // 但更严谨的做法是转为 char* 运算。v1版本此处逻辑简化，假定对齐。
-        curSlot_ += SlotSize_ / sizeof(Slot);
+        // 注意：这里进行指针运算，原本采用SlotSize_ / sizeof(Slot) 
+        // C++ 中指针加法是以 sizeof(T) 为单位的。
+        // 如果 SlotSize_ 是 24 字节，sizeof(Slot) 是 8 字节，那么 +3 是对的。
+        // 但如果 SlotSize_ 不是 sizeof(Slot) 的整数倍，这种写法会产生错误的偏移。转换为 char* 操作字节是最安全的。
+        curSlot_ = reinterpret_cast<Slot*>(reinterpret_cast<char*>(curSlot_) + SlotSize_);
     } 
-    return temp;
+    return reinterpret_cast<void*>(temp);
 }
 
 void MemoryPool::deallocate(void* ptr)
@@ -70,36 +107,58 @@ void MemoryPool::deallocate(void* ptr)
 
     // 将用户指针强制转换为 Slot*，以便将其挂回链表
     Slot* slot = reinterpret_cast<Slot*>(ptr);
+    // 需要转换为 Slot* 后再入栈,因为 freeList_ 管理的就是 Slot* 链表
     pushFreeList(slot);
 }
 
 void MemoryPool::allocateNewBlock()
 {   
-    // TODO：【核心分配逻辑】向系统申请新的大块内存并初始化
-    // 1. 使用 operator new 申请 BlockSize_ 大小的内存
-    // 2. 建立 Block 链表：将新块的 next 指向旧的 firstBlock_，更新 firstBlock_
-    // 3. 计算数据区起始地址（跳过 Block 头部存放指针的空间）
-    // 4. 调用 padPointer 计算对齐填充量
-    // 5. 初始化 curSlot_（数据区起点+填充）和 lastSlot_（边界标记）
+    // 1. 申请原始大内存块
+    void* newBlock = operator new(BlockSize_);
     
-    // 申请内存
-    Slot * Block = reinterpret_cast<Slot*> (operator new (BlockSize_));
+    // 2. 建立 Block 链表：
+    // 每个 Block 的开头 8 字节（sizeof(Slot*)）用于存储指向前一个 Block 的指针，
+    // 这样在销毁 MemoryPool 时可以顺着链表释放所有申请过的 Block。
+    // 注意是store，不是直接赋值, 也不是load
+    reinterpret_cast<Slot*>(newBlock)->next.store(firstBlock_, std::memory_order_relaxed);
+    firstBlock_ = reinterpret_cast<Slot*>(newBlock);
+
+    // 3. 计算数据区的物理起点
+    // 跳过开头的管理指针。注意：此时 dataAddr 的偏移量是 8。
+    // static_cast（逻辑还原）：用于 C++ 标准定义过的合法类型路径。将 void* 转换为 char* 属于语义上的“类型还原”，编译器会进行路径检查，更安全、更规范。
+    // reinterpret_cast（二进制重解释）：用于物理层面的硬转。它不关心逻辑，只是简单地将比特位强行解释为另一种类型（如整数转指针），通常用于处理完全无关的类型。
+    char* dataAddr = static_cast<char*>(newBlock) + sizeof(Slot*);
+
+    // 4. 【对齐策略思考记录】
+    // 思考 A：为什么要对齐？
+    //    operator new 保证 16 字节对齐，但跳过 8 字节指针后，dataAddr 变成了 8 字节对齐。
+    //
+    // 思考 B：按 SlotSize_ 对齐还是按固定值对齐？
+    //    - 若按 SlotSize_ 对齐：绝对安全但浪费严重。例如 SlotSize_=512，dataAddr=8，
+    //      padPointer 会跳过 504 字节凑齐 512，导致 Block 开头浪费 12% 的空间。
+    //    - 若按 16 字节对齐（alignof(std::max_align_t)）：
+    //      这是 64 位系统的标准对齐要求。即便 SlotSize_=512，也只需跳过 8 字节凑齐 16 字节对齐即可。
+    //      这样可以最大化利用 Block 空间，且对于 99% 的 C++ 对象是安全的。
+    //
+    // 结论：采用 16 字节作为基础对齐步长。
+    size_t alignment = 16; 
+    size_t padSize = padPointer(dataAddr, alignment);
     
-    // 链表头插法：新块 -> 旧块
-    Block->next = firstBlock_;
-    firstBlock_ = Block;
-    // 计算数据体开始位置：块首地址 + 指针大小（用来存next）
-    char* dataAddr = reinterpret_cast<char*>(Block) + sizeof(Slot*);
+    // 设置当前可分配的第一个槽位
+    curSlot_ = reinterpret_cast<Slot*>(dataAddr + padSize);
 
-    // 计算对齐
-    size_t padSize = padPointer(dataAddr,SlotSize_);
+    // 5. 【边界计算与 512 字节规格的“宿命”】
+    // 思考：4096 / 512 = 8，为什么总是只能分出 7 个？
+    //    因为 BlockSize(4096) - 管理头(8字节) = 4088 字节。
+    //    4088 / 512 = 7.98，在物理空间上绝对不足以放下第 8 个槽位。
+    //    这个“浪费”是由于 BlockSize 设定的太死导致的，无法通过对齐算法找回。
+    //    但对于其他规格（如 500 字节），按 16 字节对齐能比按 500 字节对齐多存出一个 Slot。
     
-    // 设置游标
-    curSlot_ = reinterpret_cast<Slot*> (dataAddr + padSize);
-
-    // 设置边界：Block末尾 - Slot大小 + 1（确保最后一个位置能被用上
-    lastSlot_ = reinterpret_cast<Slot*>(reinterpret_cast<size_t>(Block) + BlockSize_ -SlotSize_+1);
-
+    // lastSlot_ 标记最后一个能完整容纳 SlotSize_ 的位置
+    // lastSlot_ 的计算公式为 Block起始 + BlockSize - SlotSize + 1。
+    // 这个 +1 的设计是为了配合 allocate() 中的 if (curSlot_ >= lastSlot_) 判断。
+    // 它确保了只要 curSlot_ 还没到达 lastSlot_，当前位置就一定能切出一个完整的 SlotSize_ 给用户使用，不会发生越界写。
+    lastSlot_ = reinterpret_cast<Slot*>(static_cast<char*>(newBlock) + BlockSize_ - SlotSize_ + 1);
 }
 
 // 让指针对齐到槽大小的倍数位置
@@ -113,8 +172,15 @@ size_t MemoryPool::padPointer(char* p, size_t align)
     return (rem==0 ? 0:align - rem);
 }
 
+/* 
+ * 无锁链表风险对比：
+ * 1. Push：操作的是【私有节点】，指针指向的内存由当前线程绝对控制，无并发销毁风险。
+ * 2. Pop：操作的是【共享节点】，在读取 next 指针时，该节点可能已在其他线程中被弹出、
+ *    甚至随所属大块内存一同被归还系统，存在典型的“Hazard Pointer”访问风险。
+ */
+
 // 实现无锁入队操作（头插法）
-bool MemoryPool::pushFreeList(Slot* slot)
+void MemoryPool::pushFreeList(Slot* slot)
 {
     // TODO：【无锁进栈】使用 CAS 循环将节点插入链表头部
     // 1. 构造一个死循环 (while(true))，因为 CAS 可能会失败需重试
@@ -126,14 +192,22 @@ bool MemoryPool::pushFreeList(Slot* slot)
     //    - 失败时：自动更新 oldHead 为最新的 freeList_，循环重试
     while(true){
         // 获取当前头节点
+        // 在 push 操作中，初始的 load 只是一个“猜测（Hint）”!!!
+        // 真正的同步逻辑是由下方的 compare_exchange_weak 完成的。
+        // 使用 relaxed 可以减少不必要的内存屏障开销。
         Slot* oldHead = freeList_.load(std::memory_order_relaxed);
         // 将新节点的 next 指向当前头节点
+        // 【安全性分析】
+        // push 操作无需 try-catch：此时 slot 指针由当前线程独占（刚从用户处归还），
+        // 在 CAS 成功发布到 freeList_ 前，其他线程无法感知该地址。
+        // 因此，写入 slot->next 属于安全的私有操作，不存在并发销毁导致的非法访问。
         slot->next.store(oldHead,std::memory_order_relaxed);
         // 尝试将新节点设置为头节点
         // oldHead 是期望值，slot 是新值
+        // 由FreeList_ 调用 compare_exchange_weak！！
         if(freeList_.compare_exchange_weak(oldHead,slot,std::memory_order_release,std::memory_order_relaxed)){
-            return true;
-        }
+            return;
+        };
         // 失败：说明在此期间另一个线程修改了 freeList_，oldHead 被自动更新为最新值
         // CAS 失败则 continue 重试
     }
@@ -157,18 +231,21 @@ Slot* MemoryPool::popFreeList()
         // 在访问 newHead 之前再次验证 oldHead 的有效性
         if(oldHead == nullptr)
             return nullptr;
+        /* 
+        * 【核心安全点：Pop vs Push】
+        * 不同于 push 操作只修改当前线程拥有的私有节点，pop 操作需要解引用共享节点：oldHead.ptr->next。
+        * 
+        * 在通用的无锁栈中，这是一个极度危险的区域：若 oldHead 指向的内存被其他线程弹出并立即释放给系统，
+        * 此处解引用会导致段错误（Segmentation Fault）。
+        *
+        * 【本实现安全性证明】
+        * 在本 MemoryPool 设计中，Block 内存块仅在 MemoryPool 析构时释放。
+        * 只要 MemoryPool 对象生命周期未结束，所有 Slot 的物理地址在运行时始终有效。
+        * 即使 oldHead 被其他线程抢先弹出并重新分配（ABA），解引用操作依然是物理安全的。
+        */
 
-        Slot* newHead = nullptr;
-        try
-        {
-            // 读取下一个节点，准备将其提升为头节点
-            newHead = oldHead->next.load(std::memory_order_relaxed);
-        }
-        catch(...)
-        {
-            // 极端防御：如果在读取过程中发生异常（如内存被意外回收），重试
-            continue;
-        }
+        // 读取下一个节点，准备将其提升为头节点
+        Slot* newHead = oldHead->next.load(std::memory_order_relaxed);
         
         // 尝试更新头结点：将 freeList_ 指向 oldHead->next
         if(freeList_.compare_exchange_weak(oldHead,newHead,std::memory_order_acquire,std::memory_order_relaxed)){

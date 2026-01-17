@@ -1,0 +1,1 @@
+/usr/bin/c++  -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/MemoryPoolProject.dir/src/MemoryPool.cpp.o CMakeFiles/MemoryPoolProject.dir/tests/UnitTest.cpp.o -o MemoryPoolProject  -lpthread
